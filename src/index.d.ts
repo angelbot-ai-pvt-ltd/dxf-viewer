@@ -29,6 +29,8 @@ export type DxfViewerOptions = {
     sceneOptions?: DxfSceneOptions,
     retainParsedDxf?: boolean,
     preserveDrawingBuffer?: boolean,
+    /** TeamSync fork: cap on spatial vertex index size. */
+    snapMaxVertices?: number,
     fileEncoding?: string
     renderer?: THREE.WebGLRenderer | null,
 }
@@ -50,6 +52,21 @@ export type LayerInfo = {
 export type EventName = "loaded" | "cleared" | "destroyed" | "resized" | "pointerdown" |
     "pointerup" | "viewChanged" | "message"
 
+export type ScenePoint = { x: number, y: number }
+
+export type RaycastResult = {
+    point: ScenePoint
+    vertex: ScenePoint | null
+}
+
+/** TeamSync fork helper exposing the snap index. */
+export interface VertexIndex {
+    Nearest(x: number, y: number, tolerance: number): ScenePoint | null
+    readonly totalVertices: number
+    readonly indexedVertices: number
+    readonly stride: number
+}
+
 export declare class DxfViewer {
     constructor(domContainer: HTMLElement, options: DxfViewerOptions | null)
     Clear(): void
@@ -57,7 +74,7 @@ export declare class DxfViewer {
     FitView(minX: number, maxX: number, minY: number, maxY: number, padding: number): void
     GetCamera(): THREE.OrthographicCamera
     GetCanvas(): HTMLCanvasElement
-    GetLayers(): Iterable<LayerInfo>
+    GetLayers(nonEmptyOnly?: boolean): LayerInfo[]
     GetOrigin(): THREE.Vector2
     GetBounds(): {maxX: number, maxY: number, minX: number, minY: number} | null
     GetRenderer(): THREE.WebGLRenderer | null
@@ -70,6 +87,18 @@ export declare class DxfViewer {
     ShowLayer(name: string, show: boolean): void
     Subscribe(eventName: EventName, eventHandler: (event: any) => void): void
     Unsubscribe(eventName: EventName, eventHandler: (event: any) => void): void
+
+    // TeamSync fork: review-toolkit API.
+    SnapToVertex(canvasX: number, canvasY: number, tolPx?: number): ScenePoint | null
+    Raycast(canvasX: number, canvasY: number): RaycastResult
+    AddOverlay(object3D: THREE.Object3D): number
+    RemoveOverlay(id: number): void
+    ClearOverlays(): void
+    SetLayerColor(name: string, hex: number | string | null): void
+    ClearLayerColorOverrides(): void
+    SceneToCanvas(x: number, y: number): { x: number, y: number }
+    CanvasToScene(canvasX: number, canvasY: number): ScenePoint
+    GetVertexIndex(): VertexIndex | null
 }
 
 export declare namespace DxfViewer {

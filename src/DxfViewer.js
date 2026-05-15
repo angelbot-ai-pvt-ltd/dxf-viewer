@@ -5,6 +5,7 @@ import {MaterialKey} from "./MaterialKey.js"
 import {ColorCode, DxfScene} from "./DxfScene.js"
 import {OrbitControls} from "./OrbitControls.js"
 import {RBTree} from "./RBTree.js"
+import {VertexIndex} from "./VertexIndex.js"
 
 
 /** Level in "message" events. */
@@ -34,6 +35,23 @@ export class DxfViewer {
         this.clearColor = this.options.clearColor.getHex()
 
         this.scene = new three.Scene()
+
+        // TeamSync fork: overlay scene rendered AFTER the main DXF scene
+        // with autoClear=false. Hosts measurement lines, redline shapes,
+        // and any custom three.Object3D the app wants to draw on top of
+        // the drawing. Origin convention matches main scene: objects are
+        // added in world coords minus this.origin, just like batches.
+        this.overlayScene = new three.Scene()
+        /** Map<id, Object3D> -- ids returned by AddOverlay so the app can
+         *  remove individual overlays without tracking three refs. */
+        this.overlays = new Map()
+        this._nextOverlayId = 1
+
+        /** Lazy KDBush built after Load(). Null until then. */
+        this.vertexIndex = null
+
+        /** Map<layerName, originalColorsByObjUuid> for SetLayerColor undo. */
+        this._layerColorOverrides = new Map()
 
        this.ownsRenderer = !options.renderer
        this.renderer = options.renderer
@@ -229,6 +247,17 @@ export class DxfViewer {
             this._LoadBatch(scene, batch)
         }
 
+        // TeamSync fork: build the spatial vertex index for snap. Cheap
+        // for sub-cap drawings; gets downsampled for huge ones.
+        try {
+            this.vertexIndex = new VertexIndex(scene, {
+                maxVertices: this.options.snapMaxVertices,
+            })
+        } catch (e) {
+            this._Message("Failed to build vertex index for snap: " + e, MessageLevel.WARN)
+            this.vertexIndex = null
+        }
+
         this._Emit("loaded")
 
         if (scene.bounds) {
@@ -250,6 +279,15 @@ export class DxfViewer {
     Render() {
         this._EnsureRenderer()
         this.renderer.render(this.scene, this.camera)
+        // TeamSync fork: composite the overlay scene on top without
+        // clearing the framebuffer. Overlay materials are configured
+        // with depthTest=false so they sit visually above DXF lines.
+        if (this.overlays.size > 0) {
+            this.renderer.autoClear = false
+            this.renderer.clearDepth()
+            this.renderer.render(this.overlayScene, this.camera)
+            this.renderer.autoClear = true
+        }
     }
 
     /** @return {Iterable<{name:String, color:number}>} List of layer names. */
@@ -299,6 +337,13 @@ export class DxfViewer {
         this.blocks.clear()
         this.materials.each(e => e.material.dispose())
         this.materials.clear()
+        // TeamSync fork: tear down overlay state on Clear() too, otherwise
+        // pins from the previous drawing would survive a Load() of a new
+        // one.
+        this.overlayScene.clear()
+        this.overlays.clear()
+        this._layerColorOverrides.clear()
+        this.vertexIndex = null
         this.SetView({x: 0, y: 0}, 2)
         this._Emit("cleared")
         this.Render()
@@ -415,6 +460,196 @@ export class DxfViewer {
     Unsubscribe(eventName, eventHandler) {
         this._EnsureRenderer()
         this.canvas.removeEventListener(EVENT_NAME_PREFIX + eventName, eventHandler)
+    }
+
+    // ========================================================================
+    // TeamSync fork: review-toolkit API
+    // ========================================================================
+
+    /**
+     * Find the nearest indexed vertex to a canvas-pixel coordinate.
+     * Returns scene-space coords or null if nothing is within tolerance.
+     *
+     * @param {number} canvasX  Canvas-relative pixel X.
+     * @param {number} canvasY  Canvas-relative pixel Y.
+     * @param {number} [tolPx=8]  Snap radius in pixels.
+     * @return {?{x:number, y:number}}
+     */
+    SnapToVertex(canvasX, canvasY, tolPx = 8) {
+        if (!this.vertexIndex) return null
+        const scenePoint = this._CanvasToSceneCoord(canvasX, canvasY)
+        // Convert pixel tolerance to scene units using current camera.
+        const halfWidth = (this.camera.right - this.camera.left) / 2 / this.camera.zoom
+        const sceneTol = (tolPx / (this.canvasWidth / 2)) * halfWidth
+        return this.vertexIndex.Nearest(scenePoint.x, scenePoint.y, sceneTol)
+    }
+
+    /**
+     * Quick raycast against the loaded scene. Currently returns a coarse
+     * result: scene point at the click + the snapped vertex (if any).
+     * Entity-level picking would require a richer index from the worker.
+     *
+     * @param {number} canvasX
+     * @param {number} canvasY
+     * @return {{point:{x:number,y:number}, vertex:?{x:number,y:number}}}
+     */
+    Raycast(canvasX, canvasY) {
+        const point = this._CanvasToSceneCoord(canvasX, canvasY)
+        const vertex = this.SnapToVertex(canvasX, canvasY)
+        return {point, vertex}
+    }
+
+    /**
+     * Add a three.Object3D to the overlay scene. The object should be
+     * positioned in WORLD coordinates -- the fork handles the origin
+     * offset internally when rendering.
+     *
+     * @param {three.Object3D} object3D
+     * @return {number} Overlay id. Pass back to RemoveOverlay() to drop.
+     */
+    AddOverlay(object3D) {
+        this._EnsureRenderer()
+        const id = this._nextOverlayId++
+        // Translate the overlay so its world-space coords align with the
+        // DXF scene's origin-shifted coordinate system. Callers think in
+        // world coords; we subtract the scene origin once on insert.
+        if (this.origin) {
+            object3D.position.x -= this.origin.x
+            object3D.position.y -= this.origin.y
+        }
+        object3D.userData.__teamsync_overlay_id = id
+        this.overlays.set(id, object3D)
+        this.overlayScene.add(object3D)
+        this.Render()
+        return id
+    }
+
+    /** Remove an overlay previously added via AddOverlay. No-op if id unknown. */
+    RemoveOverlay(id) {
+        const obj = this.overlays.get(id)
+        if (!obj) return
+        this.overlayScene.remove(obj)
+        this.overlays.delete(id)
+        // Best-effort geometry cleanup so we don't leak GPU buffers on a
+        // long-lived viewer. Caller may also dispose materials themselves.
+        if (obj.geometry && typeof obj.geometry.dispose === "function") {
+            obj.geometry.dispose()
+        }
+        this.Render()
+    }
+
+    /** Remove every overlay. */
+    ClearOverlays() {
+        for (const id of Array.from(this.overlays.keys())) {
+            this.RemoveOverlay(id)
+        }
+    }
+
+    /**
+     * Override the color of every object on a layer.
+     * @param {string} name  Layer name as returned from GetLayers().
+     * @param {?number|string} hex  Hex color (e.g. 0xff8800 or "#ff8800").
+     *   Pass null to restore the layer's original color.
+     */
+    SetLayerColor(name, hex) {
+        this._EnsureRenderer()
+        const layer = this.layers.get(name)
+        if (!layer) return
+        if (hex == null) {
+            this._RestoreLayerColors(name, layer)
+        } else {
+            this._OverrideLayerColors(name, layer, new three.Color(hex))
+        }
+        this.Render()
+    }
+
+    /** Restore every layer's original color. */
+    ClearLayerColorOverrides() {
+        for (const [name, layer] of this.layers) {
+            if (this._layerColorOverrides.has(name)) {
+                this._RestoreLayerColors(name, layer)
+            }
+        }
+        this.Render()
+    }
+
+    /**
+     * Convert a scene-space point to canvas-pixel coordinates relative
+     * to the canvas's bounding rect. Mirrors what app overlays do by
+     * hand and lets them stop reaching into camera internals.
+     */
+    SceneToCanvas(x, y) {
+        const camera = this.camera
+        const localX = x - this.origin.x - camera.position.x
+        const localY = y - this.origin.y - camera.position.y
+        const halfWidth = (camera.right - camera.left) / 2 / camera.zoom
+        const halfHeight = (camera.top - camera.bottom) / 2 / camera.zoom
+        const ndcX = localX / halfWidth
+        const ndcY = localY / halfHeight
+        return {
+            x: (ndcX + 1) * 0.5 * this.canvasWidth,
+            y: (1 - ndcY) * 0.5 * this.canvasHeight,
+        }
+    }
+
+    /**
+     * Convert canvas pixel coordinates to scene-space coordinates.
+     * Public-API wrapper around the previously-private projection helper.
+     */
+    CanvasToScene(canvasX, canvasY) {
+        return this._CanvasToSceneCoord(canvasX, canvasY)
+    }
+
+    /** @return {?VertexIndex} The internal snap index. May be null. */
+    GetVertexIndex() {
+        return this.vertexIndex
+    }
+
+    _OverrideLayerColors(name, layer, threeColor) {
+        let saved = this._layerColorOverrides.get(name)
+        if (!saved) {
+            saved = new Map()
+            this._layerColorOverrides.set(name, saved)
+        }
+        for (const obj of layer.objects ?? []) {
+            const material = obj.material
+            if (!material) continue
+            // Capture the original color exactly once so a re-override
+            // doesn't lose the true original.
+            if (!saved.has(obj.uuid)) {
+                if (material.uniforms?.color?.value) {
+                    saved.set(obj.uuid, material.uniforms.color.value.clone())
+                } else if (material.color) {
+                    saved.set(obj.uuid, material.color.clone())
+                } else {
+                    saved.set(obj.uuid, null)
+                }
+            }
+            if (material.uniforms?.color?.value) {
+                material.uniforms.color.value.copy(threeColor)
+                material.uniformsNeedUpdate = true
+            } else if (material.color) {
+                material.color.copy(threeColor)
+            }
+        }
+    }
+
+    _RestoreLayerColors(name, layer) {
+        const saved = this._layerColorOverrides.get(name)
+        if (!saved) return
+        for (const obj of layer.objects ?? []) {
+            const orig = saved.get(obj.uuid)
+            if (!orig) continue
+            const material = obj.material
+            if (!material) continue
+            if (material.uniforms?.color?.value) {
+                material.uniforms.color.value.copy(orig)
+                material.uniformsNeedUpdate = true
+            } else if (material.color) {
+                material.color.copy(orig)
+            }
+        }
+        this._layerColorOverrides.delete(name)
     }
 
     // /////////////////////////////////////////////////////////////////////////////////////////////
@@ -722,8 +957,16 @@ DxfViewer.DefaultOptions = {
      * memory.
      */
     retainParsedDxf: false,
-    /** Whether to preserve the buffers until manually cleared or overwritten. */
+    /** Whether to preserve the buffers until manually cleared or overwritten.
+     *  Required `true` to support PNG export from the canvas (otherwise
+     *  WebGL clears the framebuffer after each present).
+     */
     preserveDrawingBuffer: false,
+    /** TeamSync fork: cap the spatial vertex index used by SnapToVertex().
+     *  Vertices above this count are downsampled to bound memory at the
+     *  cost of approximate snap fidelity.
+     */
+    snapMaxVertices: 500_000,
     /** Encoding to use for decoding DXF file text content. DXF files newer than DXF R2004 (AC1018)
      * use UTF-8 encoding. Older files use some code page which is specified in $DWGCODEPAGE header
      * variable. Currently parser is implemented in such a way that encoding must be specified

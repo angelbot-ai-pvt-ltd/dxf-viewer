@@ -1,11 +1,12 @@
 {
-    "name": "dxf-viewer",
-    "version": "1.0.47",
-    "description": "JavaScript DXF file viewer",
+    "name": "@angelbot-ai-pvt-ltd/dxf-viewer",
+    "version": "1.0.47-ts.0",
+    "description": "JavaScript DXF file viewer -- TeamSync fork with raycasting, snapping, and overlay APIs.",
     "main": "src/index.js",
-    "author": "Artyom Lebedev<artyom.lebedev@gmail.com>",
+    "types": "src/index.d.ts",
+    "author": "TeamSync (forked from Artyom Lebedev)",
     "license": "MPL-2.0",
-    "repository": "https://github.com/vagran/dxf-viewer",
+    "repository": "https://github.com/angelbot-ai-pvt-ltd/dxf-viewer",
     "type": "module",
     "keywords": [
         "dxf",
@@ -13,7 +14,8 @@
         "javascript",
         "webgl",
         "html5",
-        "cad"
+        "cad",
+        "teamsync"
     ],
     "files": [
         "src",
@@ -25,10 +27,17 @@
     "dependencies": {
         "loglevel": "^1.9.1",
         "opentype.js": "^1.3.4",
-        "three": "^0.161.0",
-        "earcut": "^3.0.0"
+        "earcut": "^3.0.0",
+        "kdbush": "^4.0.2"
+    },
+    "peerDependencies": {
+        "three": ">=0.161.0"
     },
     "devDependencies": {
-        "@types/three": "^0.161.2"
+        "@types/three": "^0.161.2",
+        "three": "^0.161.0"
+    },
+    "publishConfig": {
+        "registry": "https://npm.pkg.github.com"
     }
 }
