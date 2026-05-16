@@ -458,7 +458,15 @@ export class DxfViewer {
      * @param eventHandler {function}
      */
     Unsubscribe(eventName, eventHandler) {
-        this._EnsureRenderer()
+        // TeamSync fork: Unsubscribe is by nature a teardown helper --
+        // React effect cleanups call it after the viewer has been
+        // Destroy()'d. Upstream's `_EnsureRenderer()` throws if the
+        // renderer has been torn down, which crashes the cleanup and
+        // bubbles up into the React error boundary ("WebGL renderer not
+        // available. Probable WebGL context loss") even though it's
+        // purely a teardown race. No-op gracefully when there's no
+        // canvas left to remove from.
+        if (!this.HasRenderer() || !this.canvas) return
         this.canvas.removeEventListener(EVENT_NAME_PREFIX + eventName, eventHandler)
     }
 

@@ -1,6 +1,6 @@
 {
     "name": "@angelbot-ai-pvt-ltd/dxf-viewer",
-    "version": "1.0.47-ts.1",
+    "version": "1.0.47-ts.2",
     "description": "JavaScript DXF file viewer -- TeamSync fork with raycasting, snapping, and overlay APIs.",
     "main": "src/index.js",
     "types": "src/index.d.ts",
