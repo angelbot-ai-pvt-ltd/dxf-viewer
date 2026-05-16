@@ -88,17 +88,20 @@ export class VertexIndex {
     /** Return {x, y} of the nearest vertex within `tolerance` (in scene
      *  units), or null if none. */
     Nearest(x, y, tolerance) {
-        // KDBush.within returns ids inside a bounding box; we then pick the
-        // closest by Euclidean distance. For ~8 results inside a tight
-        // tolerance box this is trivial.
+        // KDBush v4 stores coords on the typed-array `coords` field
+        // ([x0, y0, x1, y1, ...]); `within()` returns the storage ids,
+        // and `coords[id*2]` is x, `coords[id*2+1]` is y. An older v3 API
+        // used `.points`/`.ids` which doesn't exist on v4 -- using it
+        // throws "this.index.points is undefined" on every snap.
         const tol2 = tolerance * tolerance
         const ids = this.index.within(x, y, tolerance)
         if (!ids.length) return null
+        const coords = this.index.coords
         let best = null
         let bestDist2 = Infinity
         for (const id of ids) {
-            const px = this.index.points[id * 2]
-            const py = this.index.points[id * 2 + 1]
+            const px = coords[id * 2]
+            const py = coords[id * 2 + 1]
             const dx = px - x
             const dy = py - y
             const d2 = dx * dx + dy * dy
