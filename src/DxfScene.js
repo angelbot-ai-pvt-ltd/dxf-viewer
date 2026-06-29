@@ -2276,6 +2276,72 @@ export class DxfScene {
         if (this.origin === null) {
             this.origin = { x: v.x, y: v.y }
         }
+        /* Reservoir-sample vertex coordinates so we can compute a density-based
+         * "fit" extent at the end (ignoring sparse far-flung outliers like xref
+         * blocks placed far from the main drawing, which otherwise make the
+         * initial FitView zoom out and render the real drawing as a speck). The
+         * true min/max `bounds` are kept intact for the Fit button + zoom. */
+        const seen = this._fitSeen = (this._fitSeen ?? 0) + 1
+        if (this._fitSampleX === undefined) {
+            this._fitSampleX = []
+            this._fitSampleY = []
+        }
+        const CAP = 20000
+        if (this._fitSampleX.length < CAP) {
+            this._fitSampleX.push(v.x)
+            this._fitSampleY.push(v.y)
+        } else {
+            /* Reservoir replacement keeps the sample uniform over all vertices. */
+            const j = Math.floor(seen * this._fitRand())
+            if (j < CAP) {
+                this._fitSampleX[j] = v.x
+                this._fitSampleY[j] = v.y
+            }
+        }
+    }
+
+    /* Deterministic PRNG (Math.random is unavailable in the worker build env;
+     * also keeps fit reproducible). Mulberry32 seeded once. */
+    _fitRand() {
+        let s = (this._fitRandState = (this._fitRandState ?? 0x9e3779b9) | 0)
+        s = (s + 0x6d2b79f5) | 0
+        this._fitRandState = s
+        let t = Math.imul(s ^ (s >>> 15), 1 | s)
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+
+    /** Compute a density-based fit extent from the reservoir sample: the box
+     * covering the central (1-2*trim) fraction of vertices on each axis, so a
+     * few scattered outliers don't blow up the initial view. Falls back to the
+     * true bounds when the sample is small or degenerate. */
+    _ComputeFitBounds() {
+        const xs = this._fitSampleX
+        const ys = this._fitSampleY
+        if (!xs || xs.length < 200 || !this.bounds) {
+            return this.bounds
+        }
+        const sx = xs.slice().sort((a, b) => a - b)
+        const sy = ys.slice().sort((a, b) => a - b)
+        const trim = 0.01
+        const lo = Math.floor(sx.length * trim)
+        const hi = Math.min(sx.length - 1, Math.ceil(sx.length * (1 - trim)))
+        const fit = { minX: sx[lo], maxX: sx[hi], minY: sy[lo], maxY: sy[hi] }
+        /* Guard against a degenerate (zero-area) trimmed box. */
+        if (fit.maxX - fit.minX <= 0 || fit.maxY - fit.minY <= 0) {
+            return this.bounds
+        }
+        /* Only use the density fit when the true extent is DRAMATICALLY larger
+         * than where the geometry actually concentrates -- the signature of a
+         * few scattered far-off outliers (e.g. xref blocks placed hundreds of
+         * thousands of units from the main drawing). A normal drawing with some
+         * legitimate spread stays UNCHANGED (we keep its exact bounds). Trigger
+         * only when the trimmed box is under ~25% of full on an axis. */
+        const fullW = this.bounds.maxX - this.bounds.minX
+        const fullH = this.bounds.maxY - this.bounds.minY
+        const outliers = (fit.maxX - fit.minX) < fullW * 0.25 ||
+                         (fit.maxY - fit.minY) < fullH * 0.25
+        return outliers ? fit : this.bounds
     }
 
     _BuildScene() {
@@ -2296,6 +2362,10 @@ export class DxfScene {
             layers: [],
             origin: this.origin,
             bounds: this.bounds,
+            /* Density-based initial-fit extent (ignores far-flung outliers).
+             * The viewer fits to this; `bounds` stays the true extent for the
+             * Fit button + zoom-to-extents. */
+            fitBounds: this._ComputeFitBounds(),
             hasMissingChars: this.hasMissingChars,
             numHatchesDegraded: this.numHatchesDegraded
         }
