@@ -22,21 +22,25 @@ export class VertexIndex {
      *   The serialized scene object returned by DxfWorker.Load.
      * @param {{maxVertices?: number}} options
      */
+    /** @param scene A single serialized scene, OR an array of scene chunks
+     *  (progressive build). Vertices from all chunks are indexed together. */
     constructor(scene, options = {}) {
         const maxVertices = options.maxVertices ?? DEFAULT_MAX_VERTICES
-        const origin = scene.origin ?? {x: 0, y: 0}
+        const scenes = Array.isArray(scene) ? scene : [scene]
 
-        // First pass: count total vertices across batches (skip block
-        // definitions -- block-instance batches reference the same vertex
-        // data via transforms, not their own positions, and would inflate
-        // the index without representing reachable geometry).
+        // First pass: count total vertices across all chunks' batches (skip
+        // block definitions -- block-instance batches reference the same vertex
+        // data via transforms, not their own positions, and would inflate the
+        // index without representing reachable geometry).
         let total = 0
-        for (const batch of scene.batches) {
-            if (this._SkipBatch(batch)) continue
-            if (batch.verticesSize) total += batch.verticesSize / 2
-            if (batch.chunks) {
-                for (const c of batch.chunks) {
-                    if (c.verticesSize) total += c.verticesSize / 2
+        for (const s of scenes) {
+            for (const batch of s.batches) {
+                if (this._SkipBatch(batch)) continue
+                if (batch.verticesSize) total += batch.verticesSize / 2
+                if (batch.chunks) {
+                    for (const c of batch.chunks) {
+                        if (c.verticesSize) total += c.verticesSize / 2
+                    }
                 }
             }
         }
@@ -49,10 +53,10 @@ export class VertexIndex {
         // Stored in scene-space (NOT canvas-space). SnapToVertex projects
         // a query pixel to a scene point first and then queries here.
         let written = 0
-        const addBatch = (batchVerticesOffset, verticesSize) => {
+        const addBatch = (sceneVertices, origin, batchVerticesOffset, verticesSize) => {
             if (!verticesSize) return
             const arr = new Float32Array(
-                scene.vertices,
+                sceneVertices,
                 batchVerticesOffset * Float32Array.BYTES_PER_ELEMENT,
                 verticesSize)
             // arr is [x0, y0, x1, y1, ...]
@@ -67,14 +71,17 @@ export class VertexIndex {
             }
         }
 
-        for (const batch of scene.batches) {
-            if (this._SkipBatch(batch)) continue
-            if (batch.verticesSize) {
-                addBatch(batch.verticesOffset, batch.verticesSize)
-            }
-            if (batch.chunks) {
-                for (const chunk of batch.chunks) {
-                    addBatch(chunk.verticesOffset, chunk.verticesSize)
+        for (const s of scenes) {
+            const origin = s.origin ?? {x: 0, y: 0}
+            for (const batch of s.batches) {
+                if (this._SkipBatch(batch)) continue
+                if (batch.verticesSize) {
+                    addBatch(s.vertices, origin, batch.verticesOffset, batch.verticesSize)
+                }
+                if (batch.chunks) {
+                    for (const chunk of batch.chunks) {
+                        addBatch(s.vertices, origin, chunk.verticesOffset, chunk.verticesSize)
+                    }
                 }
             }
         }

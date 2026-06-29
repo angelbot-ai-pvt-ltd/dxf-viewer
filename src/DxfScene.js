@@ -121,7 +121,18 @@ export class DxfScene {
      *  loaded font object (opentype.js). They are invoked only when necessary. Each glyph is being
      *  searched sequentially in each provided font.
      */
-    async Build(dxf, fontFetchers) {
+    /**
+     * @param dxf Parsed DXF.
+     * @param fontFetchers See above.
+     * @param sceneChunkCbk {?Function} When provided, enables PROGRESSIVE build:
+     *  geometry is emitted in chunks via sceneChunkCbk(sceneChunk, isLast) as it
+     *  is processed, so the caller can render partial results before the whole
+     *  drawing is built. Each chunk is a self-contained serialized scene (its
+     *  own transferable buffers). The cumulative `bounds` is carried on every
+     *  chunk so the caller can fit the view early. When omitted, the full scene
+     *  is built once and exposed as `this.scene` (legacy behavior).
+     */
+    async Build(dxf, fontFetchers, sceneChunkCbk = null) {
         const header = dxf.header || {}
 
         for (const [name, value] of Object.entries(header)) {
@@ -185,6 +196,8 @@ export class DxfScene {
             }
         }
 
+        const chunkSize = sceneChunkCbk ? (this.options.progressiveChunkSize || 0) : 0
+        let sinceChunk = 0
         for (const block of this.blocks.values()) {
             if (block.data.hasOwnProperty("entities")) {
                 const blockCtx = block.DefinitionContext()
@@ -193,20 +206,39 @@ export class DxfScene {
                         continue
                     }
                     this._ProcessDxfEntity(entity, blockCtx)
+                    sinceChunk++
                 }
             }
             if (block.SetFlatten()) {
                 this.numBlocksFlattened++
             }
+            /* Progressive: emit a chunk between whole blocks once a chunk's worth
+             * of block-definition geometry has accumulated. We only chunk BETWEEN
+             * blocks (never mid-block) so a block's batches + SetFlatten stay in
+             * one scene. Block-definition geometry the main thread accumulates
+             * into its block table across chunks, so instances (processed below)
+             * still resolve every definition. */
+            if (chunkSize > 0 && sinceChunk >= chunkSize) {
+                sinceChunk = 0
+                sceneChunkCbk(this._BuildScene(), false)
+                this._ResetBatches()
+            }
         }
         console.log(`${this.numBlocksFlattened} blocks flattened`)
 
+        /* Continue accumulating toward the same chunk threshold across the
+         * top-level entity pass (reuse chunkSize/sinceChunk from above). */
         for (const entity of dxf.entities) {
             if (!this._FilterEntity(entity)) {
                 this.numEntitiesFiltered++
                 continue
             }
             this._ProcessDxfEntity(entity)
+            if (chunkSize > 0 && ++sinceChunk >= chunkSize) {
+                sinceChunk = 0
+                sceneChunkCbk(this._BuildScene(), false)
+                this._ResetBatches()
+            }
         }
         console.log(`${this.numEntitiesFiltered} entities filtered`)
         if (this.numHatchesDegraded > 0) {
@@ -216,12 +248,26 @@ export class DxfScene {
                 `hatch budget (consumed ${this.hatchLinesConsumed})`)
         }
 
-        this.scene = this._BuildScene()
+        if (chunkSize > 0) {
+            /* Final chunk: whatever batches remain (may be empty if the entity
+             * count was an exact multiple of chunkSize -- an empty scene is a
+             * harmless no-op on the consumer side). */
+            sceneChunkCbk(this._BuildScene(), true)
+            this.scene = null
+        } else {
+            this.scene = this._BuildScene()
+        }
 
         delete this.batches
         delete this.layers
         delete this.blocks
         delete this.textRenderer
+    }
+
+    /** Re-initialize the per-chunk batch accumulator after a progressive chunk
+     * has been emitted. Mirrors the constructor's `this.batches` init. */
+    _ResetBatches() {
+        this.batches = new RBTree((b1, b2) => b1.key.Compare(b2.key))
     }
 
     /** @return False to suppress the specified entity, true to permit rendering. */
@@ -2897,6 +2943,11 @@ DxfScene.DefaultOptions = {
      * Beyond this, pattern hatches degrade to a solid fill (see
      * DEFAULT_HATCH_LINE_BUDGET). 0 or negative disables the budget. */
     hatchLineBudget: DEFAULT_HATCH_LINE_BUDGET,
+    /** Progressive build: emit the scene in chunks of ~this many processed
+     * entities so the viewer can render partial results early (big drawings
+     * appear before the whole thing is built). 0 disables (single-scene build).
+     * Only takes effect when Build() is given a sceneChunkCbk. */
+    progressiveChunkSize: 0,
     /** Text rendering options. */
     textOptions: TextRenderer.DefaultOptions,
 }

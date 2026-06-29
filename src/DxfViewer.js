@@ -205,21 +205,98 @@ export class DxfViewer {
         this.Clear()
 
         this.worker = new DxfWorker(workerFactory ? workerFactory() : null)
-        const {scene, dxf} = await this.worker.Load(url, fonts, this.options, progressCbk)
+
+        /* Progressive build: when progressiveChunkSize > 0 the worker streams the
+         * scene as chunks so we can render partial geometry before the whole
+         * drawing is built (big drawings appear early). We accumulate the chunks
+         * for the snap index (built once at the end) and fit the view on the
+         * first chunk only so the camera doesn't jump as more geometry arrives.
+         *
+         * DxfScene reads its config from options.sceneOptions, so mirror the
+         * top-level progressiveChunkSize into sceneOptions for the worker. */
+        const chunkSize = this.options.progressiveChunkSize || 0
+        const progressive = chunkSize > 0
+        if (progressive) {
+            this.options.sceneOptions = Object.assign(
+                {}, this.options.sceneOptions, { progressiveChunkSize: chunkSize })
+        }
+        const sceneChunks = []
+        let firstChunkFitted = false
+
+        const onChunk = (chunk) => {
+            if (!chunk) return
+            this._LoadSceneChunk(chunk)
+            sceneChunks.push(chunk)
+            this.origin = chunk.origin
+            this.bounds = chunk.bounds
+            if (!firstChunkFitted && chunk.bounds) {
+                firstChunkFitted = true
+                this.FitView(chunk.bounds.minX - chunk.origin.x, chunk.bounds.maxX - chunk.origin.x,
+                             chunk.bounds.minY - chunk.origin.y, chunk.bounds.maxY - chunk.origin.y)
+            } else if (chunk.bounds) {
+                /* Keep the running fit current as bounds grow, but don't re-fit
+                 * once the user could be interacting -- only before controls
+                 * exist (i.e. during the streaming phase). */
+                this.Render()
+            }
+        }
+
+        const {scene, dxf} = await this.worker.Load(
+            url, fonts, this.options, progressCbk, progressive ? onChunk : null)
         await this.worker.Destroy()
         this.worker = null
         this.parsedDxf = dxf
 
-        this.origin = scene.origin
-        this.bounds = scene.bounds
-        this.hasMissingChars = scene.hasMissingChars
-
-        for (const layer of scene.layers) {
-            this.layers.set(layer.name, new Layer(layer.name, layer.displayName, layer.color))
+        if (progressive) {
+            /* Geometry already loaded chunk-by-chunk via onChunk. Metadata
+             * (hasMissingChars) lives on the last chunk; bounds/origin were set
+             * as chunks arrived. */
+            const last = sceneChunks[sceneChunks.length - 1]
+            this.hasMissingChars = last ? last.hasMissingChars : false
+            this._BuildVertexIndex(sceneChunks)
+            this._Emit("loaded")
+            if (!this.bounds) {
+                this._Message("Empty document", MessageLevel.WARN)
+            }
+        } else {
+            this.origin = scene.origin
+            this.bounds = scene.bounds
+            this.hasMissingChars = scene.hasMissingChars
+            this._LoadSceneChunk(scene)
+            this._BuildVertexIndex([scene])
+            this._Emit("loaded")
+            if (scene.bounds) {
+                this.FitView(scene.bounds.minX - scene.origin.x, scene.bounds.maxX - scene.origin.x,
+                             scene.bounds.minY - scene.origin.y, scene.bounds.maxY - scene.origin.y)
+            } else {
+                this._Message("Empty document", MessageLevel.WARN)
+            }
         }
-        this.defaultLayer = this.layers.get("0") ?? new Layer("0", "0", 0)
 
-        /* Load all blocks on the first pass. */
+        if (this.hasMissingChars) {
+            this._Message("Some characters cannot be properly displayed due to missing fonts",
+                          MessageLevel.WARN)
+        }
+
+        this._CreateControls()
+        this.Render()
+    }
+
+    /** Load one serialized scene (or scene chunk) into the live three.js scene:
+     * registers its layers + block definitions, then instantiates batches with
+     * fills first (see ordering note below). Used for both the single-scene path
+     * and each progressive chunk. */
+    _LoadSceneChunk(scene) {
+        for (const layer of scene.layers) {
+            if (!this.layers.has(layer.name)) {
+                this.layers.set(layer.name, new Layer(layer.name, layer.displayName, layer.color))
+            }
+        }
+        if (!this.defaultLayer) {
+            this.defaultLayer = this.layers.get("0") ?? new Layer("0", "0", 0)
+        }
+
+        /* Block definitions first. */
         for (const batch of scene.batches) {
             if (batch.key.blockName !== null &&
                 batch.key.geometryType !== BatchingKey.GeometryType.BLOCK_INSTANCE &&
@@ -234,22 +311,12 @@ export class DxfViewer {
             }
         }
 
-        console.log(`DXF scene:
-                     ${scene.batches.length} batches,
-                     ${this.layers.size} layers,
-                     ${this.blocks.size} blocks,
-                     vertices ${scene.vertices.byteLength} B,
-                     indices ${scene.indices.byteLength} B
-                     transforms ${scene.transforms.byteLength} B`)
-
-        /* Instantiate all entities. Filled-area batches (solid HATCH/SOLID
-         * triangles) are loaded FIRST so they are inserted into the scene --
-         * and therefore painted -- before linework and text. The renderer runs
-         * with sortObjects:false, so draw order is insertion order; without
-         * this an opaque solid fill batched after the linework would paint over
-         * it and hide grids, arcs, dimensions, and labels sitting on top of a
-         * filled region. (renderOrder is also set on each object as a
-         * belt-and-suspenders measure for the sortObjects:true case.) */
+        /* Instantiate entities. Filled-area batches (solid HATCH/SOLID triangles)
+         * are loaded FIRST so they are inserted -- and painted -- before linework
+         * and text. The renderer runs with sortObjects:false, so draw order is
+         * insertion order; an opaque solid fill batched after the linework would
+         * paint over it and hide grids/dimensions/labels on top of a filled
+         * region. (renderOrder is also set per object as a backstop.) */
         const isFillBatch = (batch) =>
             batch.key.geometryType === BatchingKey.GeometryType.TRIANGLES ||
             batch.key.geometryType === BatchingKey.GeometryType.INDEXED_TRIANGLES
@@ -263,34 +330,21 @@ export class DxfViewer {
                 this._LoadBatch(scene, batch)
             }
         }
+    }
 
-        // TeamSync fork: build the spatial vertex index for snap. Cheap
-        // for sub-cap drawings; gets downsampled for huge ones.
+    /** Build the snap vertex index over one or more scene chunks. Done once,
+     * after all geometry has loaded (KDBush needs a fixed capacity up front). */
+    _BuildVertexIndex(scenes) {
+        // TeamSync fork: build the spatial vertex index for snap. Cheap for
+        // sub-cap drawings; gets downsampled for huge ones.
         try {
-            this.vertexIndex = new VertexIndex(scene, {
+            this.vertexIndex = new VertexIndex(scenes.length === 1 ? scenes[0] : scenes, {
                 maxVertices: this.options.snapMaxVertices,
             })
         } catch (e) {
             this._Message("Failed to build vertex index for snap: " + e, MessageLevel.WARN)
             this.vertexIndex = null
         }
-
-        this._Emit("loaded")
-
-        if (scene.bounds) {
-            this.FitView(scene.bounds.minX - scene.origin.x, scene.bounds.maxX - scene.origin.x,
-                         scene.bounds.minY - scene.origin.y, scene.bounds.maxY - scene.origin.y)
-        } else {
-            this._Message("Empty document", MessageLevel.WARN)
-        }
-
-        if (this.hasMissingChars) {
-            this._Message("Some characters cannot be properly displayed due to missing fonts",
-                          MessageLevel.WARN)
-        }
-
-        this._CreateControls()
-        this.Render()
     }
 
     Render() {
@@ -992,6 +1046,12 @@ DxfViewer.DefaultOptions = {
      *  cost of approximate snap fidelity.
      */
     snapMaxVertices: 500_000,
+    /** Progressive rendering: when > 0 and a worker is used, the scene is built
+     * and delivered in chunks of ~this many entities, so large drawings appear
+     * before the whole file is processed. The view fits to the first chunk; the
+     * snap index is built once all chunks arrive. 0 disables (single-scene
+     * build -- legacy behavior). A few tens of thousands is a good value. */
+    progressiveChunkSize: 0,
     /** Encoding to use for decoding DXF file text content. DXF files newer than DXF R2004 (AC1018)
      * use UTF-8 encoding. Older files use some code page which is specified in $DWGCODEPAGE header
      * variable. Currently parser is implemented in such a way that encoding must be specified

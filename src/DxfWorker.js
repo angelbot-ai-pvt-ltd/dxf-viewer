@@ -31,14 +31,19 @@ export class DxfWorker {
      * @param {?string[]} fonts Fonts URLs.
      * @param options Viewer options. See DxfViewer.DefaultOptions.
      * @param {?Function} progressCbk (phase, processedSize, totalSize)
+     * @param {?Function} chunkCbk (sceneChunk, isLast) -- progressive scene chunks.
+     *  Only invoked when options.progressiveChunkSize > 0. When used, the resolved
+     *  result carries metadata only (scene === null); geometry arrives via chunks.
      */
-    async Load(url, fonts, options, progressCbk) {
+    async Load(url, fonts, options, progressCbk, chunkCbk = null) {
         if (this.worker) {
             return this._SendRequest(DxfWorker.WorkerMsg.LOAD,
                                      { url, fonts, options: this._CloneOptions(options) },
-                                     progressCbk)
+                                     progressCbk, chunkCbk)
         } else {
-            return this._Load(url, fonts, options, progressCbk)
+            /* No worker: run synchronously on the main thread, delivering chunks
+             * directly to chunkCbk if progressive. */
+            return this._Load(url, fonts, options, progressCbk, chunkCbk)
         }
     }
 
@@ -77,14 +82,27 @@ export class DxfWorker {
     async _ProcessRequestMessage(type, data, transfers, seq) {
         switch (type) {
         case DxfWorker.WorkerMsg.LOAD: {
+            /* Progressive build is requested when the cloned options carry a
+             * positive progressiveChunkSize. Each chunk is posted as its own
+             * message (buffers transferred); the LOAD response then carries only
+             * metadata (dxf), with scene === null. */
+            const progressive = data.options && (
+                (data.options.progressiveChunkSize || 0) > 0 ||
+                (data.options.sceneOptions && (data.options.sceneOptions.progressiveChunkSize || 0) > 0))
+            const chunkCbk = progressive
+                ? (sceneChunk, isLast) => this._SendChunk(seq, sceneChunk, isLast)
+                : null
             const {scene, dxf} = await this._Load(
                 data.url,
                 data.fonts,
                 data.options,
-                (phase, size, totalSize) => this._SendProgress(seq, phase, size, totalSize))
-            transfers.push(scene.vertices)
-            transfers.push(scene.indices)
-            transfers.push(scene.transforms)
+                (phase, size, totalSize) => this._SendProgress(seq, phase, size, totalSize),
+                chunkCbk)
+            if (scene) {
+                transfers.push(scene.vertices)
+                transfers.push(scene.indices)
+                transfers.push(scene.transforms)
+            }
             return {scene, dxf}
         }
         case DxfWorker.WorkerMsg.DESTROY:
@@ -113,6 +131,14 @@ export class DxfWorker {
             }
             return
         }
+        if (msg.type === DxfWorker.WorkerMsg.CHUNK) {
+            /* Progressive scene chunk -- deliver and keep the request open until
+             * the final LOAD response arrives. */
+            if (req.chunkCbk) {
+                req.chunkCbk(data.scene, data.isLast)
+            }
+            return
+        }
         this.requests.delete(seq)
         if (msg.hasOwnProperty("error")) {
             req.SetError(msg.error)
@@ -128,9 +154,9 @@ export class DxfWorker {
         requests.forEach(req => req.SetError(error))
     }
 
-    async _SendRequest(type, data = null, progressCbk = null) {
+    async _SendRequest(type, data = null, progressCbk = null, chunkCbk = null) {
         const seq = this.reqSeq++
-        const req = new DxfWorker.Request(seq, progressCbk)
+        const req = new DxfWorker.Request(seq, progressCbk, chunkCbk)
         this.requests.set(seq, req)
         this.worker.postMessage({ seq, type, data, signature: MSG_SIGNATURE})
         return await req.GetResponse()
@@ -145,8 +171,29 @@ export class DxfWorker {
         })
     }
 
-    /** @return {Object} DxfScene serialized scene. */
-    async _Load(url, fonts, options, progressCbk) {
+    /** Post one progressively-built scene chunk to the main thread. The chunk's
+     * geometry buffers are transferred (ownership moves to the main thread). */
+    _SendChunk(seq, sceneChunk, isLast) {
+        const transfers = []
+        if (sceneChunk) {
+            if (sceneChunk.vertices) transfers.push(sceneChunk.vertices)
+            if (sceneChunk.indices) transfers.push(sceneChunk.indices)
+            if (sceneChunk.transforms) transfers.push(sceneChunk.transforms)
+        }
+        this.worker.postMessage({
+            seq,
+            type: DxfWorker.WorkerMsg.CHUNK,
+            data: {scene: sceneChunk, isLast},
+            signature: MSG_SIGNATURE
+        }, transfers)
+    }
+
+    /** @param chunkCbk {?Function} (sceneChunk, isLast) -- when provided, the
+     *  scene is built progressively and each chunk is delivered here instead of
+     *  being returned. The return value then carries only metadata (no scene).
+     *  @return {Object} { scene, dxf } in non-progressive mode; { dxf } when
+     *  chunkCbk is used (scene delivered via the callback). */
+    async _Load(url, fonts, options, progressCbk, chunkCbk = null) {
         let fontFetchers
         if (fonts) {
             fontFetchers = this._CreateFontFetchers(fonts, progressCbk)
@@ -158,6 +205,10 @@ export class DxfWorker {
             progressCbk("prepare", 0, null)
         }
         const dxfScene = new DxfScene(options)
+        if (chunkCbk) {
+            await dxfScene.Build(dxf, fontFetchers, chunkCbk)
+            return {scene: null, dxf: options.retainParsedDxf === true ? dxf : undefined }
+        }
         await dxfScene.Build(dxf, fontFetchers)
         return {scene: dxfScene.scene, dxf: options.retainParsedDxf === true ? dxf : undefined }
     }
@@ -204,13 +255,16 @@ export class DxfWorker {
 DxfWorker.WorkerMsg = {
     LOAD: "LOAD",
     PROGRESS: "PROGRESS",
+    /** Progressive scene chunk (one partial serialized scene). */
+    CHUNK: "CHUNK",
     DESTROY: "DESTROY"
 }
 
 DxfWorker.Request = class {
-    constructor(seq, progressCbk) {
+    constructor(seq, progressCbk, chunkCbk = null) {
         this.seq = seq
         this.progressCbk = progressCbk
+        this.chunkCbk = chunkCbk
         this.promise = new Promise((resolve, reject) => {
             this._Resolve = resolve
             this._Reject = reject
