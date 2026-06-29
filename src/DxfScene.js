@@ -37,8 +37,14 @@ const MAX_HATCH_SEGMENTS = 20000
  * build. Once this budget is exhausted, remaining pattern hatches degrade to a
  * cheap solid fill in their boundary color (still visible, just not patterned).
  * Tunable via DxfScene options (hatchLineBudget). 0/negative disables the budget.
+ *
+ * Set to 150k after profiling the real corpus: the only hatch-heavy drawings
+ * (Room Configuration) spend most of their build clipping pattern lines, and
+ * 150k cuts that materially while degrading only marginally more hatches than
+ * a higher budget (the bulk degrade regardless). Lighter drawings never reach
+ * the budget, so they are unaffected.
  */
-const DEFAULT_HATCH_LINE_BUDGET = 400000
+const DEFAULT_HATCH_LINE_BUDGET = 150000
 
 
 /** Default values for system variables. Entry may be either value or function to call for obtaining
