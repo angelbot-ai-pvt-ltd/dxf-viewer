@@ -277,9 +277,14 @@ export class DxfViewer {
 
         this._Emit("loaded")
 
-        if (scene.bounds) {
-            this.FitView(scene.bounds.minX - scene.origin.x, scene.bounds.maxX - scene.origin.x,
-                         scene.bounds.minY - scene.origin.y, scene.bounds.maxY - scene.origin.y)
+        /* Initial fit uses the density-based extent (ignores far-flung outliers
+         * like scattered xref blocks that would otherwise shrink the real
+         * drawing to a speck). The true `bounds` still back the Fit button +
+         * zoom-to-extents so nothing becomes unreachable. */
+        const fit = scene.fitBounds ?? scene.bounds
+        if (fit) {
+            this.FitView(fit.minX - scene.origin.x, fit.maxX - scene.origin.x,
+                         fit.minY - scene.origin.y, fit.maxY - scene.origin.y)
         } else {
             this._Message("Empty document", MessageLevel.WARN)
         }
