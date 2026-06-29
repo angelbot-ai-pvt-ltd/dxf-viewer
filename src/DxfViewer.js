@@ -242,9 +242,26 @@ export class DxfViewer {
                      indices ${scene.indices.byteLength} B
                      transforms ${scene.transforms.byteLength} B`)
 
-        /* Instantiate all entities. */
+        /* Instantiate all entities. Filled-area batches (solid HATCH/SOLID
+         * triangles) are loaded FIRST so they are inserted into the scene --
+         * and therefore painted -- before linework and text. The renderer runs
+         * with sortObjects:false, so draw order is insertion order; without
+         * this an opaque solid fill batched after the linework would paint over
+         * it and hide grids, arcs, dimensions, and labels sitting on top of a
+         * filled region. (renderOrder is also set on each object as a
+         * belt-and-suspenders measure for the sortObjects:true case.) */
+        const isFillBatch = (batch) =>
+            batch.key.geometryType === BatchingKey.GeometryType.TRIANGLES ||
+            batch.key.geometryType === BatchingKey.GeometryType.INDEXED_TRIANGLES
         for (const batch of scene.batches) {
-            this._LoadBatch(scene, batch)
+            if (isFillBatch(batch)) {
+                this._LoadBatch(scene, batch)
+            }
+        }
+        for (const batch of scene.batches) {
+            if (!isFillBatch(batch)) {
+                this._LoadBatch(scene, batch)
+            }
         }
 
         // TeamSync fork: build the spatial vertex index for snap. Cheap
@@ -1127,6 +1144,14 @@ class Batch {
             throw new Error("Unexpected geometry type:" + this.key.geometryType)
         }
 
+        /* Filled triangles (solid HATCH/SOLID) render behind everything else
+         * so they don't occlude linework/text. See the renderOrder comment in
+         * CreateObject below. */
+        const isFill =
+            this.key.geometryType === BatchingKey.GeometryType.TRIANGLES ||
+            this.key.geometryType === BatchingKey.GeometryType.INDEXED_TRIANGLES
+        const geomRenderOrder = isFill ? 0 : 1
+
         function CreateObject(vertices, indices) {
             const geometry = instanceBatch ?
                 new three.InstancedBufferGeometry() : new three.BufferGeometry()
@@ -1139,6 +1164,15 @@ class Batch {
             obj.frustumCulled = false
             obj.matrixAutoUpdate = false
             obj._dxfViewerLayer = layer
+            /* Draw filled areas (solid HATCH/SOLID triangles) BEHIND line and
+             * text geometry so fills don't occlude grids, arcs, dimensions, and
+             * labels -- matching how desktop CAD viewers composite fills under
+             * linework. The actual ordering is enforced by insertion order in
+             * Load() (fills added first) because the renderer runs with
+             * sortObjects:false, which skips three.js's renderOrder sort. This
+             * renderOrder is set as a belt-and-suspenders measure so the
+             * ordering still holds if sortObjects is ever enabled. */
+            obj.renderOrder = geomRenderOrder
             return obj
         }
 
