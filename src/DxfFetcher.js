@@ -13,15 +13,13 @@ export class DxfFetcher {
         const totalSize = +response.headers.get('Content-Length')
 
         /* Renditions may be gzip-compressed at rest (DXF is highly compressible
-         * text). When the object is served WITHOUT a Content-Encoding header
-         * (otherwise the browser inflates transparently), we detect gzip from
-         * the .gz URL suffix and inflate via DecompressionStream. Uncompressed
-         * responses fall through to the original path unchanged, so older
-         * non-gzipped renditions keep loading. */
-        let body = response.body
-        if (this._IsGzip(response)) {
-            body = response.body.pipeThrough(new DecompressionStream("gzip"))
-        }
+         * text -- typically 5-10x). The storage key is an opaque UUID with no
+         * extension, and the object is served WITHOUT a Content-Encoding header
+         * (otherwise the browser would inflate transparently), so we detect
+         * gzip from the content's magic bytes (1f 8b) and inflate via
+         * DecompressionStream. Uncompressed responses are passed through
+         * unchanged, so older non-gzipped renditions keep loading. */
+        const body = await this._MaybeInflate(response)
 
         const reader = body.getReader()
         let receivedSize = 0
@@ -49,27 +47,50 @@ export class DxfFetcher {
         return parser.parseSync(buffer)
     }
 
-    /** Decide whether the response body needs manual gzip inflation.
+    /** Return a byte stream for the response body, transparently inflating it
+     * when the content is gzip-compressed.
      *
-     * If the server sent `Content-Encoding: gzip`, the browser already inflated
-     * the body transparently -- we must NOT inflate again. Otherwise, treat the
-     * object as gzip when its URL path ends in `.gz` (query string ignored).
-     * DecompressionStream is available in modern browsers and Web Workers.
+     * The browser already inflates when the server set `Content-Encoding: gzip`,
+     * so in that case we never double-inflate (we pass through). Otherwise we
+     * peek the first two bytes for the gzip magic (0x1f 0x8b); if present, the
+     * already-read prefix is re-prepended and the reconstructed stream is piped
+     * through DecompressionStream. Detection is content-based (not URL/header
+     * based) because rendition keys are opaque UUIDs with no extension.
      */
-    _IsGzip(response) {
+    async _MaybeInflate(response) {
         const enc = (response.headers.get("Content-Encoding") || "").toLowerCase()
-        if (enc.includes("gzip")) {
-            return false
+        if (enc.includes("gzip") || typeof DecompressionStream === "undefined") {
+            return response.body
         }
-        if (typeof DecompressionStream === "undefined") {
-            return false
-        }
-        let path = this.url
-        try {
-            path = new URL(this.url, "http://x").pathname
-        } catch {
-            /* Relative or odd URL -- fall back to the raw string. */
-        }
-        return /\.gz$/i.test(path)
+
+        const reader = response.body.getReader()
+        const first = await reader.read()
+        const head = first.value ?? new Uint8Array(0)
+        const isGzip = head.length >= 2 && head[0] === 0x1f && head[1] === 0x8b
+
+        /* Rebuild a stream that re-emits the peeked first chunk, then the rest. */
+        const rebuilt = new ReadableStream({
+            start(controller) {
+                if (head.length > 0) {
+                    controller.enqueue(head)
+                }
+                if (first.done) {
+                    controller.close()
+                }
+            },
+            async pull(controller) {
+                const { done, value } = await reader.read()
+                if (done) {
+                    controller.close()
+                } else {
+                    controller.enqueue(value)
+                }
+            },
+            cancel(reason) {
+                return reader.cancel(reason)
+            }
+        })
+
+        return isGzip ? rebuilt.pipeThrough(new DecompressionStream("gzip")) : rebuilt
     }
 }
