@@ -29,6 +29,16 @@ const MAX_HATCH_LINES = 20000
  * out-of-memory issues on bad files.
  */
 const MAX_HATCH_SEGMENTS = 20000
+/** Global budget on total pattern-hatch lines generated across the WHOLE drawing.
+ * Pattern-fill hatching clips every generated line against its boundary, which is
+ * O(lines x boundary-edges). A single drawing can contain thousands of dense
+ * pattern hatches (e.g. ANSI32 crosshatch); the per-hatch MAX_HATCH_LINES cap
+ * does not bound the cumulative cost, so a pathological file can take minutes to
+ * build. Once this budget is exhausted, remaining pattern hatches degrade to a
+ * cheap solid fill in their boundary color (still visible, just not patterned).
+ * Tunable via DxfScene options (hatchLineBudget). 0/negative disables the budget.
+ */
+const DEFAULT_HATCH_LINE_BUDGET = 400000
 
 
 /** Default values for system variables. Entry may be either value or function to call for obtaining
@@ -98,6 +108,11 @@ export class DxfScene {
         this.pointShapeBlock = null
         this.numBlocksFlattened = 0
         this.numEntitiesFiltered = 0
+        /* Cumulative pattern-hatch lines generated; budgeted to bound build time
+         * on hatch-heavy drawings. See DEFAULT_HATCH_LINE_BUDGET. */
+        this.hatchLinesConsumed = 0
+        /* Count of pattern hatches degraded to solid fill once the budget tripped. */
+        this.numHatchesDegraded = 0
     }
 
     /** Build the scene from the provided parsed DXF.
@@ -194,6 +209,12 @@ export class DxfScene {
             this._ProcessDxfEntity(entity)
         }
         console.log(`${this.numEntitiesFiltered} entities filtered`)
+        if (this.numHatchesDegraded > 0) {
+            console.warn(
+                `${this.numHatchesDegraded} pattern hatch(es) degraded to solid fill ` +
+                `after exhausting the ${this.options.hatchLineBudget ?? DEFAULT_HATCH_LINE_BUDGET}-line ` +
+                `hatch budget (consumed ${this.hatchLinesConsumed})`)
+        }
 
         this.scene = this._BuildScene()
 
@@ -1112,7 +1133,10 @@ export class DxfScene {
             filteredBoundaryLoops = boundaryLoops.map(loop => loop.vertices)
         }
 
-        if (entity.isSolid) {
+        /* Emit the boundary as a solid (triangulated) fill. Used both for genuine
+         * solid hatches and as the cheap fallback for pattern hatches once the
+         * global hatch-line budget is exhausted. */
+        const emitSolidFill = () => {
             const coords = this._TransformBoundaryLoop(filteredBoundaryLoops[0], transform)
             const holes = []
             for (let i = 1; i < filteredBoundaryLoops.length; i++) {
@@ -1124,10 +1148,24 @@ export class DxfScene {
             for (const loop of filteredBoundaryLoops) {
                 vertices.push(...loop)
             }
-            yield new Entity({
+            return new Entity({
                 type: Entity.Type.TRIANGLES,
                 vertices, indices, layer, color
             })
+        }
+
+        if (entity.isSolid) {
+            yield emitSolidFill()
+            return
+        }
+
+        /* Global hatch-line budget: if pattern hatching has already consumed the
+         * budget, don't generate (and clip) thousands more lines -- degrade this
+         * pattern hatch to a solid fill so it stays visible without the cost. */
+        const budget = this.options.hatchLineBudget ?? DEFAULT_HATCH_LINE_BUDGET
+        if (budget > 0 && this.hatchLinesConsumed >= budget) {
+            this.numHatchesDegraded++
+            yield emitSolidFill()
             return
         }
 
@@ -1219,6 +1257,12 @@ export class DxfScene {
                     console.warn("Too many lines produced by hatching pattern")
                     continue
                 }
+
+                /* Account this pattern-line family against the global budget. The
+                 * budget gates whole subsequent hatches (checked at the top of
+                 * _DecomposeHatch), so the current hatch always completes -- this
+                 * just records how much it cost so the NEXT hatch can degrade. */
+                this.hatchLinesConsumed += Math.max(0, maxLineIdx - minLineIdx + 1)
 
                 let dashPatLength
                 if (line.dashes && line.dashes.length > 1) {
@@ -2246,7 +2290,8 @@ export class DxfScene {
             layers: [],
             origin: this.origin,
             bounds: this.bounds,
-            hasMissingChars: this.hasMissingChars
+            hasMissingChars: this.hasMissingChars,
+            numHatchesDegraded: this.numHatchesDegraded
         }
 
         const buffers = {
@@ -2848,6 +2893,10 @@ DxfScene.DefaultOptions = {
     wireframeMesh: false,
     /** Suppress paper-space entities when true (only model-space is rendered). */
     suppressPaperSpace: false,
+    /** Global budget on total pattern-hatch lines generated across the drawing.
+     * Beyond this, pattern hatches degrade to a solid fill (see
+     * DEFAULT_HATCH_LINE_BUDGET). 0 or negative disables the budget. */
+    hatchLineBudget: DEFAULT_HATCH_LINE_BUDGET,
     /** Text rendering options. */
     textOptions: TextRenderer.DefaultOptions,
 }
