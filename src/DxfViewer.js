@@ -156,23 +156,41 @@ export class DxfViewer {
     SetSize(width, height) {
         this._EnsureRenderer()
 
-        const hScale = width / this.canvasWidth
-        const vScale = height / this.canvasHeight
+        const prevW = this.canvasWidth
+        const prevH = this.canvasHeight
 
-        const cam = this.camera
-        const centerX = (cam.left + cam.right) / 2
-        const centerY = (cam.bottom + cam.top) / 2
-        const camWidth = cam.right - cam.left
-        const camHeight = cam.top - cam.bottom
-        cam.left = centerX - hScale * camWidth / 2
-        cam.right = centerX + hScale * camWidth / 2
-        cam.bottom = centerY - vScale * camHeight / 2
-        cam.top = centerY + vScale * camHeight / 2
-        cam.updateProjectionMatrix()
+        /* The initial FitView (in Load) may have run before the container had
+         * its final layout, so it fit against a stale canvas size. The FIRST
+         * resize after a fit re-applies that fit at the now-correct size; doing
+         * this unconditionally on the first post-fit resize handles a stale size
+         * that is zero, small, or merely a different aspect -- all of which would
+         * otherwise be blown out by proportional scaling (realSize/staleSize).
+         * Later resizes scale proportionally so a user's pan/zoom is preserved. */
+        const reFit = this._lastFitExtent && !this._didInitialResize
+        this._didInitialResize = true
 
         this.canvasWidth = width
         this.canvasHeight = height
         this.renderer.setSize(width, height)
+
+        if (reFit) {
+            const e = this._lastFitExtent
+            this.FitView(e.minX, e.maxX, e.minY, e.maxY, e.padding)
+        } else {
+            const hScale = width / prevW
+            const vScale = height / prevH
+            const cam = this.camera
+            const centerX = (cam.left + cam.right) / 2
+            const centerY = (cam.bottom + cam.top) / 2
+            const camWidth = cam.right - cam.left
+            const camHeight = cam.top - cam.bottom
+            cam.left = centerX - hScale * camWidth / 2
+            cam.right = centerX + hScale * camWidth / 2
+            cam.bottom = centerY - vScale * camHeight / 2
+            cam.top = centerY + vScale * camHeight / 2
+            cam.updateProjectionMatrix()
+        }
+
         if (this.controls) {
             this.controls.update()
         }
@@ -366,6 +384,10 @@ export class DxfViewer {
         this.overlays.clear()
         this._layerColorOverrides.clear()
         this.vertexIndex = null
+        /* Reset the initial-fit re-application state for the next Load so the
+         * first resize after the new drawing re-applies its fit (see SetSize). */
+        this._lastFitExtent = null
+        this._didInitialResize = false
         this.SetView({x: 0, y: 0}, 2)
         this._Emit("cleared")
         this.Render()
@@ -417,6 +439,11 @@ export class DxfViewer {
 
     /** Set view to fit the specified bounds. */
     FitView(minX, maxX, minY, maxY, padding = 0.1) {
+        /* Remember the requested extent so we can re-apply it if the canvas was
+         * not yet laid out when this ran (see SetSize: a resize after a fit that
+         * happened at a stale/zero canvas size would otherwise scale the view
+         * out by realWidth/staleWidth, blowing the drawing out to full extent). */
+        this._lastFitExtent = {minX, maxX, minY, maxY, padding}
         const aspect = this.canvasWidth / this.canvasHeight
         let width = maxX - minX
         const height = maxY - minY
