@@ -114,6 +114,9 @@ export class DxfViewer {
 
         this.canvas.addEventListener("pointerdown", this._OnPointerEvent.bind(this))
         this.canvas.addEventListener("pointerup", this._OnPointerEvent.bind(this))
+        /* Wheel = zoom; also counts as user interaction so we stop auto-fitting
+         * on subsequent resizes. */
+        this.canvas.addEventListener("wheel", this._MarkUserInteracted.bind(this), {passive: true})
 
         this.Render()
 
@@ -159,15 +162,14 @@ export class DxfViewer {
         const prevW = this.canvasWidth
         const prevH = this.canvasHeight
 
-        /* The initial FitView (in Load) may have run before the container had
-         * its final layout, so it fit against a stale canvas size. The FIRST
-         * resize after a fit re-applies that fit at the now-correct size; doing
-         * this unconditionally on the first post-fit resize handles a stale size
-         * that is zero, small, or merely a different aspect -- all of which would
-         * otherwise be blown out by proportional scaling (realSize/staleSize).
-         * Later resizes scale proportionally so a user's pan/zoom is preserved. */
-        const reFit = this._lastFitExtent && !this._didInitialResize
-        this._didInitialResize = true
+        /* The initial FitView (in Load) may run before the container has its
+         * final layout, and the container can settle through SEVERAL resizes
+         * (e.g. 0 -> 300 -> full). Re-apply the fit on EVERY resize until the
+         * user actually interacts (pan/zoom) -- otherwise proportional scaling
+         * across a mid-settle size would blow the view out (realSize/staleSize).
+         * Once the user has interacted we scale proportionally to preserve their
+         * view. */
+        const reFit = this._lastFitExtent && !this._userHasInteracted
 
         this.canvasWidth = width
         this.canvasHeight = height
@@ -384,10 +386,11 @@ export class DxfViewer {
         this.overlays.clear()
         this._layerColorOverrides.clear()
         this.vertexIndex = null
-        /* Reset the initial-fit re-application state for the next Load so the
-         * first resize after the new drawing re-applies its fit (see SetSize). */
+        /* Reset the auto-fit-on-resize state for the next Load so resizes during
+         * the new drawing's layout settle re-apply its fit until the user
+         * interacts (see SetSize / _MarkUserInteracted). */
         this._lastFitExtent = null
-        this._didInitialResize = false
+        this._userHasInteracted = false
         this.SetView({x: 0, y: 0}, 2)
         this._Emit("cleared")
         this.Render()
@@ -750,7 +753,16 @@ export class DxfViewer {
         this._Emit("message", {message, level})
     }
 
+    /* Once the user pans/zooms, stop auto-re-fitting on resize so their view is
+     * preserved. Hooked to canvas pointerdown + wheel. */
+    _MarkUserInteracted() {
+        this._userHasInteracted = true
+    }
+
     _OnPointerEvent(e) {
+        if (e.type === "pointerdown") {
+            this._MarkUserInteracted()
+        }
         const canvasRect = e.target.getBoundingClientRect()
         const canvasCoord = {x: e.clientX - canvasRect.left, y: e.clientY - canvasRect.top}
         this._Emit(e.type, {
